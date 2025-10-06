@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert, Animated,
@@ -196,10 +196,10 @@ export default function App() {
 
   const [routes, setRoutes] = useState<RouteView[]>([]);
   const [selectedRoute, setSelectedRoute] = useState<number>(0);
-  const [showNodes] = useState<boolean>(true); // <-- всегда показываем; кнопка удалена
+  const [showNodes] = useState<boolean>(true); // всегда показываем узлы
   const [loading, setLoading] = useState<boolean>(false);
 
-  // Переключатель отображения всех маршрутов (оставляем)
+  // Переключатель отображения всех маршрутов
   const [showAllRoutes, setShowAllRoutes] = useState<boolean>(true);
 
   const [statusKey, setStatusKey] = useState<StatusKey>("idle");
@@ -563,6 +563,169 @@ export default function App() {
     setStatusText(`Выбран маршрут #${idx + 1}`);
   };
 
+  /** ---------- AI (Gemini) — Авто-анализ без ввода ---------- */
+  const [autoAiEnabled, setAutoAiEnabled] = useState<boolean>(true);
+  const [aiLoading, setAiLoading] = useState<boolean>(false);
+  const [aiText, setAiText] = useState<string>("");
+  const [aiSuggestedIndex, setAiSuggestedIndex] = useState<number | null>(null);
+  const lastAiSignatureRef = useRef<string>("");
+
+  const geminiEndpoint =
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+
+  // Статистика маршрута
+  const routeStats = (r: RouteView) => {
+    const turns = r.turnNodes.length;
+    const leftTurns = r.turnNodes.filter(t => (t.modifier || "").toLowerCase().includes("left")).length;
+    const roundabouts = r.turnNodes.filter(t => t.maneuverType.toLowerCase().includes("кольцев")).length;
+    const avgStep = turns ? r.turnNodes.reduce((s, t) => s + t.stepDistance, 0) / turns : 0;
+    return {
+      index: r.index,
+      isPrimary: r.isPrimary,
+      distance_m: Math.round(r.distance),
+      duration_s: Math.round(r.duration),
+      turns,
+      left_turns: leftTurns,
+      roundabouts,
+      avg_step_m: Math.round(avgStep),
+    };
+  };
+
+  // «Мягкие» предпочтения без ввода пользователя
+  const inferPreferences = (all: RouteView[]) => {
+    const now = new Date();
+    const hour = now.getHours();
+    const timeBias =
+      (hour >= 22 || hour < 6) ? "ночь: избегать сложных манёвров и кольцевых" :
+      (hour >= 7 && hour <= 10) ? "утренний час-пик: приоритет времени" :
+      (hour >= 17 && hour <= 20) ? "вечерний час-пик: приоритет времени" :
+      "день: баланс времени и удобства";
+
+    const stats = all.map(routeStats);
+    const fastest = [...stats].sort((a,b) => a.duration_s - b.duration_s)[0];
+    const fewestTurns = [...stats].sort((a,b) => a.turns - b.turns)[0];
+    const leastLeft = [...stats].sort((a,b) => a.left_turns - b.left_turns)[0];
+
+    return {
+      timeBias,
+      hints: [
+        `быстрый: индекс ${fastest.index} (${Math.round(fastest.duration_s/60)} мин)`,
+        `минимум поворотов: индекс ${fewestTurns.index} (${fewestTurns.turns} поворотов)`,
+        `минимум левых: индекс ${leastLeft.index} (${leastLeft.left_turns} левых пов.)`
+      ],
+      stats
+    };
+  };
+
+  // Сериализация пакета для LLM
+  const serializeForAutoAI = (rs: RouteView[], selectedIndex: number) => {
+    const pref = inferPreferences(rs);
+    const pack = rs.map(r => ({
+      index: r.index,
+      isPrimary: r.isPrimary,
+      distance_m: Math.round(r.distance),
+      duration_s: Math.round(r.duration),
+      turns: r.turnNodes.length,
+      left_turns: r.turnNodes.filter(t => (t.modifier || "").toLowerCase().includes("left")).length,
+      roundabouts: r.turnNodes.filter(t => t.maneuverType.toLowerCase().includes("кольцев")).length,
+      sample_turns: r.turnNodes.slice(0, 15).map(t => ({
+        m: t.maneuverType, mod: t.modifier || "", street: t.street,
+        lat: Number(t.coordinate.latitude.toFixed(6)), lon: Number(t.coordinate.longitude.toFixed(6))
+      }))
+    }));
+
+    return JSON.stringify({
+      context: {
+        time_of_day: pref.timeBias,
+        derived_hints: pref.hints,
+        selected_route_index: selectedIndex
+      },
+      routes: pack
+    });
+  };
+
+  const parseSuggestedIndex = (txt: string): number | null => {
+    const m1 = txt.match(/route[_\s-]?index\s*=\s*(\d+)/i);
+    if (m1) return Number(m1[1]);
+    const m2 = txt.match(/маршрут\s*#\s*(\d+)/i);
+    if (m2) return Number(m2[1]) - 1;
+    return null;
+  };
+
+  const routesSignature = (rs: RouteView[]) =>
+    rs.map(r => `${r.index}:${Math.round(r.distance)}:${Math.round(r.duration)}:${r.turnNodes.length}`).join("|");
+
+  const callGeminiAuto = async () => {
+    if (routes.length === 0) return;
+    try {
+      setAiLoading(true);
+      setAiText("");
+      setAiSuggestedIndex(null);
+
+      const sysPrompt =
+        "Ты — навигатор. На вход даётся JSON с альтернативными маршрутами и мягкими предпочтениями, " +
+        "которые выведены автоматически (пользователь ничего не вводил). " +
+        "Задача: 1) кратко сравни (время/дистанция/манёвры/левые повороты/кольцевые), " +
+        "2) дай 3–6 пошаговых рекомендаций для выбранного маршрута (лаконично), " +
+        "3) назови один конкретный маршрут, оптимальный под контекст времени суток и derived_hints. " +
+        "Оформи текст красиво и удобным для чтения. Не используй специальные символы для markdown " +
+        "Не задавай вопросов пользователю.";
+
+      const dataJson = serializeForAutoAI(routes, selectedRoute);
+
+      const body = {
+        contents: [
+          {
+            role: "user",
+            parts: [
+              { text: sysPrompt },
+              { text: "Данные маршрутов:\n" + dataJson }
+            ]
+          }
+        ]
+      };
+
+      const res = await fetch(`${geminiEndpoint}?key=${process.env.EXPO_PUBLIC_GEMINI_API_KEY}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+
+      console.log(res)
+
+      if (!res.ok) {
+        const t = await res.text().catch(() => "");
+        throw new Error(`${res.status}: ${t || "ошибка запроса"}`);
+      }
+
+      const json = await res.json();
+      const text =
+        json?.candidates?.[0]?.content?.parts?.map((p: any) => p?.text).filter(Boolean).join("\n").trim() ||
+        "Не удалось разобрать ответ ИИ.";
+
+      setAiText(text);
+      const idx = parseSuggestedIndex(text);
+      if (typeof idx === "number" && !Number.isNaN(idx) && idx >= 0 && idx < routes.length) {
+        setAiSuggestedIndex(idx);
+      }
+    } catch (e: any) {
+      Alert.alert("AI", e?.message || "Неизвестная ошибка при запросе к ИИ.");
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
+  // Автозапуск ИИ при смене набора маршрутов
+  useEffect(() => {
+    if (!autoAiEnabled || routes.length === 0) return;
+    const sig = routesSignature(routes);
+    if (sig === lastAiSignatureRef.current) return; // те же маршруты — пропускаем
+    lastAiSignatureRef.current = sig;
+    setTimeout(() => { callGeminiAuto(); }, 150);
+  }, [autoAiEnabled, routes, selectedRoute]); // при перестроении/перевыборе маршрута
+
+  /** ---------- /AI (Gemini) ---------- */
+
   return (
     <View style={styles.container}>
       <MapView
@@ -800,7 +963,7 @@ export default function App() {
               {/* Ошибка и список маршрутов */}
               {errorText ? <Text style={styles.errorText}>{errorText}</Text> : null}
 
-              <View style={{ marginTop: 8, paddingBottom: 16 }}>
+              <View style={{ marginTop: 8, paddingBottom: 8 }}>
                 {routes.length > 0 && (
                   <Text style={styles.routesHeaderText}>
                     Найдено маршрутов: {routes.length}. Оптимальный — сверху при показе всех.
@@ -829,6 +992,39 @@ export default function App() {
                   )}
                 />
               </View>
+
+              {/* === Auto AI (Gemini) — без ввода === */}
+              <View style={[styles.vStack, { marginTop: 12, paddingBottom: 16 }]}>
+                <Text style={styles.sectionTitle}>ИИ помощник маршрута</Text>
+
+                <TouchableOpacity
+                  style={[styles.secondaryBtn, autoAiEnabled && styles.secondaryBtnActive]}
+                  onPress={() => setAutoAiEnabled(v => !v)}
+                >
+                  <Text style={[styles.secondaryBtnText, autoAiEnabled && styles.secondaryBtnTextActive]}>
+                    Авто-анализ ИИ: {autoAiEnabled ? "вкл." : "выкл."}
+                  </Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={[styles.primaryBtn, (routes.length === 0 || aiLoading) && styles.primaryBtnDisabled]}
+                  onPress={callGeminiAuto}
+                  disabled={routes.length === 0 || aiLoading}
+                >
+                  {aiLoading ? <ActivityIndicator color="#fff" /> :
+                    <Text style={styles.primaryBtnText}>Запустить анализ сейчас</Text>}
+                </TouchableOpacity>
+
+                {aiLoading && <ActivityIndicator color="#fff" style={{ marginTop: 10 }} />}
+{aiText ? (
+  <View style={{ backgroundColor: "rgba(255,255,255,0.08)", margin: 12, padding: 12, borderRadius: 10 }}>
+    <Text style={{ color: "#EDEDED", fontWeight: "600", fontSize: 14, lineHeight: 20 }}>
+      {aiText}
+    </Text>
+  </View>
+) : null}
+              </View>
+              {/* === /Auto AI (Gemini) === */}
             </View>
           )}
         />
@@ -960,4 +1156,17 @@ const styles = StyleSheet.create({
   infoTitle: { fontWeight: "800", marginBottom: 2, color: "#111" },
   infoText: { color: "#222" },
   infoSub: { color: "#6B6B6B", fontSize: 12, marginTop: 2 },
+
+  // === AI (Gemini) ===
+  aiCard: {
+    marginTop: 8,
+    backgroundColor: "rgba(255,255,255,0.06)",
+    borderColor: STROKE,
+    borderWidth: 1,
+    borderRadius: 14,
+    padding: 12
+  },
+  aiTitle: { color: "#EDEDED", fontWeight: "800", marginBottom: 6 },
+  aiText: { color: "#EDEDED" },
+  applyBtn: { marginTop: 8 }
 });
