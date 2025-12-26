@@ -40,5 +40,3 @@ pnpm expo start
 ```
 
 > Требования: Node 18+, pnpm|npm|yarn, Android Studio или Xcode (для эмуляторов).
-
----
